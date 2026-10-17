@@ -15,6 +15,7 @@ import feign.FeignException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
@@ -36,15 +37,39 @@ public class Funcion_AsientoService {
     private final FuncionClient funcionClient;
     private final AsientoKafkaProducer asientoKafkaProducer;
 
+    // Solo responde si la reserva venció. No publica nada: avisar es otra responsabilidad.
     private boolean estaExpirado(Funcion_Asiento fa) {
-        boolean expirado = ESTADO_RESERVADO.equals(fa.getEstado())
+        return ESTADO_RESERVADO.equals(fa.getEstado())
                 && fa.getReservado_hasta() != null
                 && fa.getReservado_hasta().isBefore(LocalDateTime.now());
+    }
 
-        if (expirado) {
-            asientoKafkaProducer.enviarReservaExpirada(fa.getFuncion_id(), List.of(fa.getAsiento_id()), fa.getUsuario_id());
+    // Publica UN aviso por usuario y función (aunque tenga varios asientos vencidos).
+    // Hay que llamarlo ANTES de limpiar o reasignar el asiento, porque lee el email guardado.
+    // excluirUsuarioId: no avisa a ese usuario (ej. quien está reservando de nuevo,
+    // o quien ya recibe el aviso de compra fallida).
+    private void avisarExpiradas(List<Funcion_Asiento> expiradas, String excluirUsuarioId) {
+        if (expiradas.isEmpty()) {
+            return;
         }
-        return expirado;
+        Map<String, List<Funcion_Asiento>> porUsuario = expiradas.stream()
+                .filter(fa -> fa.getEmail_usuario() != null && !fa.getEmail_usuario().isBlank())
+                .filter(fa -> excluirUsuarioId == null || !excluirUsuarioId.equals(fa.getUsuario_id()))
+                .collect(Collectors.groupingBy(fa -> fa.getFuncion_id() + "|" + fa.getEmail_usuario()));
+
+        porUsuario.values().forEach(grupo -> {
+            Funcion_Asiento primero = grupo.get(0);
+            List<Long> ids = grupo.stream().map(Funcion_Asiento::getAsiento_id).toList();
+            asientoKafkaProducer.enviarReservaExpirada(primero.getFuncion_id(), ids, primero.getEmail_usuario());
+        });
+    }
+
+    private void dejarDisponible(Funcion_Asiento fa) {
+        fa.setEstado(ESTADO_DISPONIBLE);
+        fa.setUsuario_id(null);
+        fa.setEmail_usuario(null);
+        fa.setReservado_hasta(null);
+        fa.setActualizado_en(LocalDateTime.now());
     }
 
     private boolean esReservaPropia(Funcion_Asiento fa, String usuario_id) {
@@ -67,12 +92,8 @@ public class Funcion_AsientoService {
                 .collect(Collectors.toList());
 
         if (!expirados.isEmpty()) {
-            expirados.forEach(fa -> {
-                fa.setEstado(ESTADO_DISPONIBLE);
-                fa.setUsuario_id(null);
-                fa.setReservado_hasta(null);
-                fa.setActualizado_en(LocalDateTime.now());
-            });
+            avisarExpiradas(expirados, null);
+            expirados.forEach(this::dejarDisponible);
             funcion_AsientoRepository.saveAll(expirados);
         }
 
@@ -101,7 +122,7 @@ public class Funcion_AsientoService {
 
         Sala sala = resolverSala(funcion.getSala());
 
-        // Validación adaptativa: si el recinto es de admisión general, no genera matriz estricta de asientos individuales[cite: 28]
+        // Validación adaptativa: si el recinto es de admisión general, no genera matriz estricta de asientos individuales
         if ("GENERAL".equalsIgnoreCase(sala.getTipoRecinto())) {
             return List.of();
         }
@@ -122,8 +143,14 @@ public class Funcion_AsientoService {
         return funcion_AsientoRepository.saveAll(nuevos);
     }
 
+    // Versión sin email (se mantiene para no romper los tests existentes)
     @Transactional
     public boolean reservarAsientos(String usuario_id, Long funcion_id, List<Long> asientosIds) {
+        return reservarAsientos(usuario_id, null, funcion_id, asientosIds);
+    }
+
+    @Transactional
+    public boolean reservarAsientos(String usuario_id, String email_usuario, Long funcion_id, List<Long> asientosIds) {
         if (asientosIds == null || asientosIds.isEmpty()) {
             return false;
         }
@@ -134,6 +161,7 @@ public class Funcion_AsientoService {
 
         LocalDateTime expiracion = LocalDateTime.now().plusMinutes(5);
         List<Funcion_Asiento> aReservar = new ArrayList<>();
+        List<Funcion_Asiento> vencidasDeOtros = new ArrayList<>();
 
         for (Long asiento_id : ordenarSinRepetidos(asientosIds)) {
             Optional<Funcion_Asiento> optFuncionAsiento
@@ -144,19 +172,26 @@ public class Funcion_AsientoService {
             }
 
             Funcion_Asiento funcion_Asiento = optFuncionAsiento.get();
-            boolean libre = ESTADO_DISPONIBLE.equals(funcion_Asiento.getEstado())
-                    || estaExpirado(funcion_Asiento);
+            boolean expirado = estaExpirado(funcion_Asiento);
+            boolean libre = ESTADO_DISPONIBLE.equals(funcion_Asiento.getEstado()) || expirado;
 
             if (!libre && !esReservaPropia(funcion_Asiento, usuario_id)) {
                 return false;
             }
 
+            if (expirado) {
+                vencidasDeOtros.add(funcion_Asiento);
+            }
             aReservar.add(funcion_Asiento);
         }
+
+        // Todo validado: ahora sí se avisa a los dueños anteriores (antes de pisar sus datos)
+        avisarExpiradas(vencidasDeOtros, usuario_id);
 
         for (Funcion_Asiento funcion_Asiento : aReservar) {
             funcion_Asiento.setEstado(ESTADO_RESERVADO);
             funcion_Asiento.setUsuario_id(usuario_id);
+            funcion_Asiento.setEmail_usuario(email_usuario);
             funcion_Asiento.setReservado_hasta(expiracion);
             funcion_Asiento.setActualizado_en(LocalDateTime.now());
         }
@@ -222,12 +257,7 @@ public class Funcion_AsientoService {
             return;
         }
 
-        for (Funcion_Asiento fa : aLiberar) {
-            fa.setEstado(ESTADO_DISPONIBLE);
-            fa.setUsuario_id(null);
-            fa.setReservado_hasta(null);
-            fa.setActualizado_en(LocalDateTime.now());
-        }
+        aLiberar.forEach(this::dejarDisponible);
         funcion_AsientoRepository.saveAll(aLiberar);
     }
 
@@ -246,8 +276,9 @@ public class Funcion_AsientoService {
             Funcion_Asiento funcion_Asiento = optFuncionAsiento.get();
 
             if (estaExpirado(funcion_Asiento)) {
-                funcion_Asiento.setEstado(ESTADO_DISPONIBLE);
-                funcion_Asiento.setActualizado_en(LocalDateTime.now());
+                // Quien compra ya recibe el aviso de compra.fallida; solo se avisa si el dueño es otro
+                avisarExpiradas(List.of(funcion_Asiento), usuario_id);
+                dejarDisponible(funcion_Asiento);
                 funcion_AsientoRepository.save(funcion_Asiento);
                 return "RESERVA_EXPIRADA";
             }
@@ -279,6 +310,7 @@ public class Funcion_AsientoService {
         }
 
         List<Funcion_Asiento> aLiberar = new ArrayList<>();
+        List<Funcion_Asiento> vencidasDeOtros = new ArrayList<>();
 
         for (Long asiento_id : ordenarSinRepetidos(asientosIds)) {
             Optional<Funcion_Asiento> optFuncionAsiento
@@ -294,23 +326,25 @@ public class Funcion_AsientoService {
                 return "ASIENTO_NO_RESERVADO";
             }
 
-            if (!estaExpirado(funcion_Asiento) && !usuario_id.equals(funcion_Asiento.getUsuario_id())) {
+            boolean esDelUsuario = usuario_id.equals(funcion_Asiento.getUsuario_id());
+            boolean expirado = estaExpirado(funcion_Asiento);
+
+            if (!expirado && !esDelUsuario) {
                 return "RESERVA_DE_OTRO_USUARIO";
             }
 
+            if (expirado && !esDelUsuario) {
+                vencidasDeOtros.add(funcion_Asiento);
+            }
             aLiberar.add(funcion_Asiento);
         }
 
-        for (Funcion_Asiento funcion_Asiento : aLiberar) {
-            funcion_Asiento.setEstado(ESTADO_DISPONIBLE);
-            funcion_Asiento.setUsuario_id(null);
-            funcion_Asiento.setReservado_hasta(null);
-            funcion_Asiento.setActualizado_en(LocalDateTime.now());
-        }
+        avisarExpiradas(vencidasDeOtros, null);
+
+        aLiberar.forEach(this::dejarDisponible);
         funcion_AsientoRepository.saveAll(aLiberar);
 
-        asientoKafkaProducer.enviarReservaExpirada(funcion_id, asientosIds, usuario_id);
-
+        // Liberar a mano NO es una expiración: no se publica reserva.expirada aquí.
         return "OK";
     }
 }
