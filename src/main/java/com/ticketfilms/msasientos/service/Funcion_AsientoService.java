@@ -80,6 +80,7 @@ public class Funcion_AsientoService {
         return ids.stream().distinct().sorted().toList();
     }
 
+    @Transactional
     public List<Funcion_Asiento> obtenerMapaFuncion_Asientos(Long funcion_id) {
         List<Funcion_Asiento> asientos = funcion_AsientoRepository.findByFuncion_id(funcion_id);
 

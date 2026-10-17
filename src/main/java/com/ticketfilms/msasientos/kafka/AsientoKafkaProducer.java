@@ -10,9 +10,14 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-// Publica reserva.expirada. Si Kafka falla, solo se registra en el log:
-// un aviso perdido no debe tumbar la reserva ni el mapa de asientos.
+// Publica reserva.expirada. Reglas:
+//  - Si hay una transacción en curso, el evento se envía DESPUÉS del commit:
+//    si la transacción se revierte, no sale ningún aviso falso.
+//  - Si Kafka falla, solo se registra en el log: un aviso perdido no debe
+//    tumbar la reserva ni el mapa de asientos.
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -28,6 +33,19 @@ public class AsientoKafkaProducer {
                     funcionId, asientosIds);
             return;
         }
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    publicar(funcionId, asientosIds, emailUsuario);
+                }
+            });
+        } else {
+            publicar(funcionId, asientosIds, emailUsuario);
+        }
+    }
+
+    private void publicar(Long funcionId, List<Long> asientosIds, String emailUsuario) {
         try {
             List<String> etiquetas = asientoRepository.findAllById(asientosIds).stream()
                     .sorted(Comparator.comparing(Asiento::getFila).thenComparing(Asiento::getNumero))
