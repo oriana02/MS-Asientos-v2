@@ -17,20 +17,25 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.ticketfilms.msasientos.kafka.AsientoKafkaProducer;
 import com.ticketfilms.msasientos.model.Funcion_Asiento;
 import com.ticketfilms.msasientos.repository.Funcion_AsientoRepository;
 
 @ExtendWith(MockitoExtension.class)
 public class Funcion_AsientosServiceTest {
-    
+
     @Mock
     private Funcion_AsientoRepository funcion_AsientoRepository;
+
+    // El servicio solo decide qué reservas vencieron; publicar es del productor
+    @Mock
+    private AsientoKafkaProducer asientoKafkaProducer;
 
     @InjectMocks
     private Funcion_AsientoService funcion_AsientoService;
 
     @Test
-    public void testObtenerMapasFuncionAsientos(){
+    public void testObtenerMapasFuncionAsientos() {
         Long funcionId = 1L;
         Funcion_Asiento fa = new Funcion_Asiento();
         fa.setId(1L);
@@ -46,7 +51,7 @@ public class Funcion_AsientosServiceTest {
     }
 
     @Test
-    public void testReservarAsientosExitoso(){
+    public void testReservarAsientosExitoso() {
         Long funcionId = 1L;
         Long asientoId = 10L;
         String usuarioId = "user123";
@@ -58,8 +63,8 @@ public class Funcion_AsientosServiceTest {
         funcionAsiento.setEstado("DISPONIBLE");
 
         when(funcion_AsientoRepository.findByFuncion_idAndAsiento_idForUpdate(funcionId, asientoId))
-            .thenReturn(Optional.of(funcionAsiento));
-        
+                .thenReturn(Optional.of(funcionAsiento));
+
         when(funcion_AsientoRepository.saveAll(anyList())).thenReturn(List.of(funcionAsiento));
 
         boolean resultado = funcion_AsientoService.reservarAsientos(usuarioId, funcionId, List.of(asientoId));

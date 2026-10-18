@@ -15,7 +15,6 @@ import feign.FeignException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
@@ -42,26 +41,6 @@ public class Funcion_AsientoService {
         return ESTADO_RESERVADO.equals(fa.getEstado())
                 && fa.getReservado_hasta() != null
                 && fa.getReservado_hasta().isBefore(LocalDateTime.now());
-    }
-
-    // Publica UN aviso por usuario y función (aunque tenga varios asientos vencidos).
-    // Hay que llamarlo ANTES de limpiar o reasignar el asiento, porque lee el email guardado.
-    // excluirUsuarioId: no avisa a ese usuario (ej. quien está reservando de nuevo,
-    // o quien ya recibe el aviso de compra fallida).
-    private void avisarExpiradas(List<Funcion_Asiento> expiradas, String excluirUsuarioId) {
-        if (expiradas.isEmpty()) {
-            return;
-        }
-        Map<String, List<Funcion_Asiento>> porUsuario = expiradas.stream()
-                .filter(fa -> fa.getEmail_usuario() != null && !fa.getEmail_usuario().isBlank())
-                .filter(fa -> excluirUsuarioId == null || !excluirUsuarioId.equals(fa.getUsuario_id()))
-                .collect(Collectors.groupingBy(fa -> fa.getFuncion_id() + "|" + fa.getEmail_usuario()));
-
-        porUsuario.values().forEach(grupo -> {
-            Funcion_Asiento primero = grupo.get(0);
-            List<Long> ids = grupo.stream().map(Funcion_Asiento::getAsiento_id).toList();
-            asientoKafkaProducer.enviarReservaExpirada(primero.getFuncion_id(), ids, primero.getEmail_usuario());
-        });
     }
 
     private void dejarDisponible(Funcion_Asiento fa) {
@@ -93,7 +72,7 @@ public class Funcion_AsientoService {
                 .collect(Collectors.toList());
 
         if (!expirados.isEmpty()) {
-            avisarExpiradas(expirados, null);
+            asientoKafkaProducer.publicarReservasExpiradas(expirados, null);
             expirados.forEach(this::dejarDisponible);
             funcion_AsientoRepository.saveAll(expirados);
         }
@@ -187,7 +166,7 @@ public class Funcion_AsientoService {
         }
 
         // Todo validado: ahora sí se avisa a los dueños anteriores (antes de pisar sus datos)
-        avisarExpiradas(vencidasDeOtros, usuario_id);
+        asientoKafkaProducer.publicarReservasExpiradas(vencidasDeOtros, usuario_id);
 
         for (Funcion_Asiento funcion_Asiento : aReservar) {
             funcion_Asiento.setEstado(ESTADO_RESERVADO);
@@ -278,7 +257,7 @@ public class Funcion_AsientoService {
 
             if (estaExpirado(funcion_Asiento)) {
                 // Quien compra ya recibe el aviso de compra.fallida; solo se avisa si el dueño es otro
-                avisarExpiradas(List.of(funcion_Asiento), usuario_id);
+                asientoKafkaProducer.publicarReservasExpiradas(List.of(funcion_Asiento), usuario_id);
                 dejarDisponible(funcion_Asiento);
                 funcion_AsientoRepository.save(funcion_Asiento);
                 return "RESERVA_EXPIRADA";
@@ -340,7 +319,7 @@ public class Funcion_AsientoService {
             aLiberar.add(funcion_Asiento);
         }
 
-        avisarExpiradas(vencidasDeOtros, null);
+        asientoKafkaProducer.publicarReservasExpiradas(vencidasDeOtros, null);
 
         aLiberar.forEach(this::dejarDisponible);
         funcion_AsientoRepository.saveAll(aLiberar);

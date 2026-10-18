@@ -26,7 +26,7 @@ public class AsientoKafkaConsumer {
     private final Funcion_AsientoService funcion_AsientoService;
     private final ObjectMapper objectMapper;
 
-    @KafkaListener(topics = KafkaTopics.COMPRA_FALLIDA, groupId = "ms-asientos-group")
+    @KafkaListener(topics = KafkaTopics.COMPRA_FALLIDA)
     public void consumirCompraFallida(String mensaje) {
         AsientoEventoDto evento = leerEvento(mensaje);
         log.info("Evento recibido [{}] funcion={} usuario={}",
